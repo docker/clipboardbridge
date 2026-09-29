@@ -3,8 +3,8 @@
 package clipboardbridge
 
 // bridge implements the server side of the wlr-data-control Wayland protocol,
-// just enough for a clipboard reader (arboard / wl-clipboard-rs, as used by
-// Codex) to paste a host image with Ctrl+V. We are not a compositor: there are
+// enough for native clients (arboard / wl-clipboard-rs, as used by Codex) to
+// paste host images and copy text to the host. We are not a compositor: there are
 // no surfaces, input, or rendering — only a wl_seat and the data-control
 // objects a paste needs.
 //
@@ -28,6 +28,9 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"sync"
+	"time"
+	"unicode/utf8"
 
 	"golang.org/x/sys/unix"
 )
@@ -95,12 +98,22 @@ const (
 	offerReqReceive = 0
 	offerReqDestroy = 1
 	offerEvtOffer   = 0
+
+	sourceReqOffer     = 0
+	sourceReqDestroy   = 1
+	sourceEvtSend      = 0
+	sourceEvtCancelled = 1
 )
+
+const clipboardCopyTimeout = 5 * time.Second
+const clipboardCopyMaxBytes = 1 << 20
 
 // server holds the dependencies shared across all client connections.
 type server struct {
-	host hostClipboard
-	log  *slog.Logger
+	host        hostClipboard
+	log         *slog.Logger
+	selectionMu sync.Mutex
+	selection   uint64
 }
 
 func newServer(host hostClipboard, log *slog.Logger) *server {
@@ -112,16 +125,18 @@ func newServer(host hostClipboard, log *slog.Logger) *server {
 
 // connState is the per-connection object table and id allocator.
 type connState struct {
-	objects   map[uint32]objKind
-	offerData map[uint32][]byte // cached host bytes per advertised offer
-	nextID    uint32
+	objects    map[uint32]objKind
+	offerData  map[uint32][]byte // cached host bytes per advertised offer
+	sourceMIME map[uint32]string
+	nextID     uint32
 }
 
 func newConnState() *connState {
 	return &connState{
-		objects:   map[uint32]objKind{displayID: kindDisplay},
-		offerData: map[uint32][]byte{},
-		nextID:    serverIDBase,
+		objects:    map[uint32]objKind{displayID: kindDisplay},
+		offerData:  map[uint32][]byte{},
+		sourceMIME: map[uint32]string{},
+		nextID:     serverIDBase,
 	}
 }
 
@@ -137,6 +152,9 @@ func (st *connState) allocID() uint32 {
 func (s *server) serve(ctx context.Context, uc *net.UnixConn) {
 	defer uc.Close()
 	c := newConn(uc)
+	defer c.closeFDs()
+	stop := context.AfterFunc(ctx, func() { _ = uc.Close() })
+	defer stop()
 	st := newConnState()
 	for {
 		m, err := c.readMessage()
@@ -165,11 +183,13 @@ func (s *server) dispatch(ctx context.Context, c *conn, st *connState, m *messag
 	case kindManager:
 		return s.onManager(ctx, c, st, m)
 	case kindDevice:
-		return s.onDevice(c, st, m)
+		return s.onDevice(ctx, c, st, m)
+	case kindSource:
+		return s.onSource(c, st, m)
 	case kindOffer:
 		return s.onOffer(c, st, m)
 	default:
-		return nil // seat, source, or unknown: nothing to do
+		return nil // seat or unknown
 	}
 }
 
@@ -269,8 +289,6 @@ func (s *server) onManager(ctx context.Context, c *conn, st *connState, m *messa
 	r := newArgReader(m.args)
 	switch m.opcode {
 	case managerReqCreateDataSource:
-		// Copy direction (sandbox→host) is out of scope; register the object so
-		// later requests on it are recognized and ignored.
 		if id, ok := r.uint32(); ok {
 			st.objects[id] = kindSource
 		}
@@ -285,14 +303,122 @@ func (s *server) onManager(ctx context.Context, c *conn, st *connState, m *messa
 	return nil
 }
 
-func (s *server) onDevice(_ *conn, st *connState, m *message) error {
+func (s *server) onDevice(ctx context.Context, c *conn, st *connState, m *message) error {
 	switch m.opcode {
 	case deviceReqSetSelection:
-		// Sandbox→host copy is out of scope; ignore.
+		source, ok := newArgReader(m.args).uint32()
+		if !ok {
+			return errors.New("invalid clipboard selection")
+		}
+		ctx, cancel := context.WithTimeout(ctx, clipboardCopyTimeout)
+		defer cancel()
+		selection := s.nextSelection()
+		deadline, _ := ctx.Deadline()
+		if err := c.uc.SetWriteDeadline(deadline); err != nil {
+			return err
+		}
+		defer c.uc.SetWriteDeadline(time.Time{})
+		if source == 0 {
+			return s.writeSelection(ctx, selection, "")
+		}
+		if st.objects[source] != kindSource {
+			return errors.New("unknown clipboard source")
+		}
+		mime := st.sourceMIME[source]
+		if mime == "" {
+			return c.writeEvent(source, sourceEvtCancelled, nil)
+		}
+		text, err := receiveText(ctx, c, source, mime)
+		if err != nil {
+			return err
+		}
+		if err := s.writeSelection(ctx, selection, text); err != nil {
+			return err
+		}
+		// The host now owns the bytes; the client need not retain a copy worker.
+		return c.writeEvent(source, sourceEvtCancelled, nil)
 	case deviceReqDestroy:
 		delete(st.objects, m.objectID)
 	}
 	return nil
+}
+
+func (s *server) nextSelection() uint64 {
+	s.selectionMu.Lock()
+	defer s.selectionMu.Unlock()
+	s.selection++
+	return s.selection
+}
+
+func (s *server) writeSelection(ctx context.Context, selection uint64, text string) error {
+	s.selectionMu.Lock()
+	defer s.selectionMu.Unlock()
+	// A slow source must not overwrite a newer selection from another client.
+	if selection != s.selection {
+		return nil
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return s.host.writeText(ctx, text)
+}
+
+func (s *server) onSource(c *conn, st *connState, m *message) error {
+	switch m.opcode {
+	case sourceReqOffer:
+		mime, ok := newArgReader(m.args).string()
+		if ok && textMIMEPriority(mime) > textMIMEPriority(st.sourceMIME[m.objectID]) {
+			st.sourceMIME[m.objectID] = mime
+		}
+	case sourceReqDestroy:
+		delete(st.objects, m.objectID)
+		delete(st.sourceMIME, m.objectID)
+		var body eventBody
+		body.uint32(m.objectID)
+		return c.writeEvent(displayID, displayEvtDeleteID, body.bytes())
+	}
+	return nil
+}
+
+func textMIMEPriority(mime string) int {
+	switch mime {
+	case "text/plain;charset=utf-8":
+		return 3
+	case "UTF8_STRING":
+		return 2
+	case "text/plain":
+		return 1
+	default:
+		return 0
+	}
+}
+
+func receiveText(ctx context.Context, c *conn, source uint32, mime string) (string, error) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		return "", errors.New("create clipboard copy pipe")
+	}
+	defer r.Close()
+	defer w.Close()
+	stop := context.AfterFunc(ctx, func() { _ = r.Close() })
+	defer stop()
+	var body eventBody
+	body.string(mime)
+	if err := c.writeEventFD(source, sourceEvtSend, body.bytes(), int(w.Fd())); err != nil {
+		return "", err
+	}
+	_ = w.Close()
+	data, err := io.ReadAll(io.LimitReader(r, clipboardCopyMaxBytes+1))
+	if err != nil {
+		return "", errors.New("read clipboard copy pipe")
+	}
+	if len(data) > clipboardCopyMaxBytes {
+		return "", errors.New("clipboard copy too large")
+	}
+	if !utf8.Valid(data) {
+		return "", errors.New("clipboard copy is not UTF-8")
+	}
+	return string(data), nil
 }
 
 func (s *server) onOffer(c *conn, st *connState, m *message) error {

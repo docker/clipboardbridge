@@ -1,16 +1,22 @@
 # clipboard-bridge
 
-A quality-of-life shim for [Docker Sandboxes][docker-sandboxes]: it lets a
-coding agent running inside a sandbox paste a screenshot from your host clipboard
-with `Ctrl+V`.
+A clipboard bridge for [Docker Sandboxes][docker-sandboxes]: it lets a
+coding agent running inside a sandbox paste host screenshots with `Ctrl+V`
+and copy text to the host clipboard.
 
 Some agents read clipboard images through a native Wayland library
 ([`wl-clipboard-rs`][wl-clipboard-rs] / [`arboard`][arboard]) rather than the
 terminal. Those reads don't cross the sandbox boundary on their own. This bridge
 listens on the sandbox's Wayland socket, speaks just enough of the
 [`wlr-data-control`][wlr-data-control] protocol to answer a paste, and fetches the
-image from the host over the sandbox proxy's clipboard endpoint. Only `image/png`
-is handled — text already pastes fine over the terminal.
+image from the host over the sandbox proxy's clipboard endpoint. Image reads
+remain subject to the host's `clipboard.imagePaste` setting.
+
+Native text copies, including Codex `/copy` and transcript selections, use the
+proxy's clipboard-write endpoint. When a client offers both HTML and plain text,
+the bridge copies the plain text. Text reads and image writes are not supported.
+Copy transfers have a five-second deadline and a 1 MiB limit on both the raw text
+and encoded request body. Clipboard contents are never logged.
 
 It's not a compositor and doesn't try to be; there are no surfaces, input, or
 rendering.
@@ -39,6 +45,8 @@ reads the clipboard. A few optional env vars:
 
 - `CLIPBOARD_BRIDGE_PROXY_URL` — host clipboard endpoint to fetch from
   (default: `http://gateway.docker.internal:3128/_sbx/clipboard`).
+- `CLIPBOARD_BRIDGE_WRITE_PROXY_URL` — host text clipboard write endpoint
+  (default: `http://gateway.docker.internal:3128/_sbx/clipboard-write`).
 - `CLIPBOARD_BRIDGE_DEBUG=1` — verbose logging (otherwise it stays quiet).
 
 ## Develop

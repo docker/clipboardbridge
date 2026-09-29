@@ -22,6 +22,8 @@ type stubClipboard struct {
 
 func (s stubClipboard) imagePNG(context.Context) ([]byte, error) { return s.data, s.err }
 
+func (s stubClipboard) writeText(context.Context, string) error { return s.err }
+
 // fakeClient drives the client side of the data-control protocol over a unix
 // socket, reusing the package's own wire codec.
 type fakeClient struct {
@@ -60,6 +62,11 @@ func (f *fakeClient) readUntil(objectID uint32, opcode uint16) *message {
 
 func newTestServer(t *testing.T, host hostClipboard) *fakeClient {
 	t.Helper()
+	return connectTestClient(t, newServer(host, nil))
+}
+
+func connectTestClient(t *testing.T, srv *server) *fakeClient {
+	t.Helper()
 	// A connected socketpair avoids the OS-specific limit on unix socket path
 	// length (the macOS temp dir alone can exceed it).
 	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
@@ -67,7 +74,6 @@ func newTestServer(t *testing.T, host hostClipboard) *fakeClient {
 	srvConn := fileConnUnix(t, fds[0], "srv")
 	cliConn := fileConnUnix(t, fds[1], "cli")
 
-	srv := newServer(host, nil)
 	go srv.serve(context.Background(), srvConn)
 	t.Cleanup(func() { _ = cliConn.Close() })
 	return &fakeClient{t: t, uc: cliConn, c: newConn(cliConn)}
