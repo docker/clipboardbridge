@@ -9,13 +9,13 @@ package clipboardbridge
 // byte stream; they travel out-of-band as SCM_RIGHTS ancillary data and are
 // matched to fd-typed arguments in arrival order.
 //
-// We only ever *receive* one fd-bearing request (offer.receive) and never send
-// fds as a server, which keeps the codec small.
+// Image reads receive an fd in offer.receive; text copies send one in source.send.
 
 import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"net"
 
 	"golang.org/x/sys/unix"
@@ -61,6 +61,9 @@ func (c *conn) readMessage() (*message, error) {
 		n, oobn, _, _, err := c.uc.ReadMsgUnix(data, oob)
 		if err != nil {
 			return nil, err
+		}
+		if n == 0 {
+			return nil, io.EOF
 		}
 		c.buf = append(c.buf, data[:n]...)
 		if oobn > 0 {
@@ -117,17 +120,36 @@ func (c *conn) popFD() (int, bool) {
 }
 
 // writeEvent frames and sends a server→client event. body is the pre-encoded
-// argument bytes (see eventBody). The server never attaches fds to events.
+// argument bytes (see eventBody).
 func (c *conn) writeEvent(objectID uint32, opcode uint16, body []byte) error {
+	return c.writeEventFD(objectID, opcode, body, -1)
+}
+
+func (c *conn) writeEventFD(objectID uint32, opcode uint16, body []byte, fd int) error {
 	size := 8 + len(body)
 	msg := make([]byte, size)
 	order.PutUint32(msg[0:4], objectID)
 	order.PutUint32(msg[4:8], uint32(size<<16)|uint32(opcode))
 	copy(msg[8:], body)
-	if _, err := c.uc.Write(msg); err != nil {
+	var oob []byte
+	if fd >= 0 {
+		oob = unix.UnixRights(fd)
+	}
+	n, _, err := c.uc.WriteMsgUnix(msg, oob, nil)
+	if err != nil {
 		return fmt.Errorf("write event: %w", err)
 	}
-	return nil
+	if n < len(msg) {
+		_, err = c.uc.Write(msg[n:])
+	}
+	return err
+}
+
+func (c *conn) closeFDs() {
+	for _, fd := range c.fds {
+		_ = unix.Close(fd)
+	}
+	c.fds = nil
 }
 
 // argReader decodes argument bytes for the few requests we actually handle.

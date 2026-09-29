@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -69,4 +70,38 @@ func TestProxyClipboardRequestBody(t *testing.T) {
 			require.Equal(t, tc.want, got)
 		})
 	}
+}
+
+func TestProxyClipboardWrite(t *testing.T) {
+	t.Setenv(hostSessionIDEnv, "session-123")
+	const text = "hello\nworld ☕\n"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, http.MethodPost, r.Method)
+		require.Equal(t, "/_sbx/clipboard-write", r.URL.Path)
+		require.Equal(t, "application/json", r.Header.Get("Content-Type"))
+		var body map[string]any
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+		require.Equal(t, map[string]any{"text": text, "session_id": "session-123"}, body)
+	}))
+	defer srv.Close()
+	t.Setenv(proxyWriteURLEnv, srv.URL+"/_sbx/clipboard-write")
+	require.NoError(t, newProxyClipboard().writeText(context.Background(), text))
+}
+
+func TestProxyClipboardWriteErrorsDoNotExposeContents(t *testing.T) {
+	const secret = "private clipboard contents"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, secret, http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+	t.Setenv(proxyWriteURLEnv, srv.URL)
+	err := newProxyClipboard().writeText(context.Background(), secret)
+	require.EqualError(t, err, "clipboard copy returned HTTP 500")
+}
+
+func TestProxyClipboardWriteLimitsEncodedBody(t *testing.T) {
+	// JSON escaping can make a valid raw selection exceed the proxy's limit.
+	text := strings.Repeat("\x00", clipboardCopyMaxBytes/2)
+	err := newProxyClipboard().writeText(context.Background(), text)
+	require.EqualError(t, err, "clipboard copy too large")
 }
