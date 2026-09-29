@@ -105,3 +105,38 @@ func TestProxyClipboardWriteLimitsEncodedBody(t *testing.T) {
 	err := newProxyClipboard().writeText(context.Background(), text)
 	require.EqualError(t, err, "clipboard copy too large")
 }
+
+func TestProxyClipboardUsesConnectionSession(t *testing.T) {
+	t.Setenv(hostSessionIDEnv, "wrong-server-session")
+	for _, session := range []string{"attach-session", ""} {
+		t.Run("session="+session, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				var body map[string]any
+				require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+				if session == "" {
+					require.NotContains(t, body, "session_id")
+				} else {
+					require.Equal(t, session, body["session_id"])
+				}
+			}))
+			defer srv.Close()
+			t.Setenv(proxyURLEnv, srv.URL)
+			t.Setenv(proxyWriteURLEnv, srv.URL)
+			ctx := context.WithValue(context.Background(), hostSessionContextKey{}, session)
+			_, err := newProxyClipboard().imagePNG(ctx)
+			require.NoError(t, err)
+			require.NoError(t, newProxyClipboard().writeText(ctx, "text"))
+		})
+	}
+}
+
+func TestProxyClipboardDeniedCopy(t *testing.T) {
+	const secret = "private contents"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { http.Error(w, secret, http.StatusForbidden) }))
+	defer srv.Close()
+	t.Setenv(proxyWriteURLEnv, srv.URL)
+	err := newProxyClipboard().writeText(context.Background(), secret)
+	require.ErrorIs(t, err, errTextCopyDisabled)
+	require.Contains(t, err.Error(), "sbx settings set clipboard.textCopy true")
+	require.NotContains(t, err.Error(), secret)
+}

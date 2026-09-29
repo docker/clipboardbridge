@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"log/slog"
 	"os"
 	"strings"
 	"testing"
@@ -183,4 +184,31 @@ func TestSlowCopyDoesNotOverwriteNewerSelection(t *testing.T) {
 	require.NoError(t, delayed.Close())
 	first.readUntil(clSource, sourceEvtCancelled)
 	require.Empty(t, host.writes)
+}
+
+type capturedLog chan string
+
+func (c capturedLog) Write(p []byte) (int, error) { c <- string(p); return len(p), nil }
+
+func TestCopyDeniedWarning(t *testing.T) {
+	logs := make(capturedLog, 1)
+	logger := slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	f := connectTestClient(t, newServer(stubClipboard{err: errTextCopyDisabled}, logger))
+	f.handshake()
+	f.selectSource("text/plain")
+	f.sendSelection("private clipboard contents")
+	require.NoError(t, f.uc.SetReadDeadline(time.Now().Add(3*time.Second)))
+	for {
+		_, err := f.c.readMessage()
+		if err != nil {
+			break
+		}
+	}
+	select {
+	case message := <-logs:
+		require.Contains(t, message, "sbx settings set clipboard.textCopy true")
+		require.NotContains(t, message, "private clipboard contents")
+	case <-time.After(3 * time.Second):
+		t.Fatal("missing consent warning")
+	}
 }

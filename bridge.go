@@ -151,6 +151,8 @@ func (st *connState) allocID() uint32 {
 // so it is cancelled on daemon shutdown rather than blocking on the HTTP timeout.
 func (s *server) serve(ctx context.Context, uc *net.UnixConn) {
 	defer uc.Close()
+	// The detached server predates attaches; each connecting process owns its session.
+	ctx = context.WithValue(ctx, hostSessionContextKey{}, peerHostSession(uc))
 	c := newConn(uc)
 	defer c.closeFDs()
 	stop := context.AfterFunc(ctx, func() { _ = uc.Close() })
@@ -165,7 +167,11 @@ func (s *server) serve(ctx context.Context, uc *net.UnixConn) {
 			return
 		}
 		if err := s.dispatch(ctx, c, st, m); err != nil {
-			s.log.Debug("clipboard-bridge: dispatch error", "error", err)
+			if errors.Is(err, errTextCopyDisabled) {
+				s.log.Warn(errTextCopyDisabled.Error())
+			} else {
+				s.log.Debug("clipboard-bridge: dispatch error", "error", err)
+			}
 			return
 		}
 	}

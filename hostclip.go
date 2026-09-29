@@ -36,10 +36,12 @@ const defaultProxyClipboardWriteURL = "http://gateway.docker.internal:3128/_sbx/
 const proxyURLEnv = "CLIPBOARD_BRIDGE_PROXY_URL"
 const proxyWriteURLEnv = "CLIPBOARD_BRIDGE_WRITE_PROXY_URL"
 
+var errTextCopyDisabled = errors.New("clipboard text copy is disabled; enable it on the host with: sbx settings set clipboard.textCopy true")
+
 // hostSessionIDEnv is the opaque per-attach session ID the sandbox injects into
 // an interactive session's environment. We relay it as session_id so the host
-// resolves which graphical session to read from. Empty when the bridge was not
-// started from an attach.
+// resolves which graphical session to access. On Linux this comes from the
+// connecting process, because the detached bridge starts before any attach.
 const hostSessionIDEnv = "SBX_HOST_SESSION_ID"
 
 // hostEnvKeys map each graphical-session variable to the SBX_HOST_* environment
@@ -55,8 +57,16 @@ var hostEnvKeys = map[string]string{
 	"DBUS_SESSION_BUS_ADDRESS": "SBX_HOST_DBUS_SESSION_BUS_ADDRESS",
 }
 
-// hostClipboard reads the host clipboard via the proxy. It is an interface so
-// the server can be tested without a live proxy.
+type hostSessionContextKey struct{}
+
+func hostSession(ctx context.Context) string {
+	if session, ok := ctx.Value(hostSessionContextKey{}).(string); ok {
+		return session
+	}
+	return os.Getenv(hostSessionIDEnv)
+}
+
+// hostClipboard reads and writes the host clipboard via the proxy.
 type hostClipboard interface {
 	// imagePNG returns the host clipboard image as PNG bytes, or an empty
 	// slice when the host clipboard holds no image. A nil error with empty
@@ -76,7 +86,7 @@ func (p *proxyClipboard) writeText(ctx context.Context, text string) error {
 	body, err := json.Marshal(struct {
 		Text      string `json:"text"`
 		SessionID string `json:"session_id,omitempty"`
-	}{text, os.Getenv(hostSessionIDEnv)})
+	}{text, hostSession(ctx)})
 	if err != nil {
 		return errors.New("encode clipboard copy")
 	}
@@ -93,6 +103,9 @@ func (p *proxyClipboard) writeText(ctx context.Context, text string) error {
 		return errors.New("clipboard copy request failed")
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusForbidden {
+		return errTextCopyDisabled
+	}
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("clipboard copy returned HTTP %d", resp.StatusCode)
 	}
@@ -130,7 +143,7 @@ func (p *proxyClipboard) imagePNG(ctx context.Context) ([]byte, error) {
 		Type      string            `json:"type"`
 		SessionID string            `json:"session_id,omitempty"`
 		HostEnv   map[string]string `json:"host_env,omitempty"`
-	}{Type: clipboardImageType, SessionID: os.Getenv(hostSessionIDEnv), HostEnv: hostEnv})
+	}{Type: clipboardImageType, SessionID: hostSession(ctx), HostEnv: hostEnv})
 	if err != nil {
 		return nil, fmt.Errorf("encode request: %w", err)
 	}
