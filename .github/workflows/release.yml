@@ -22,7 +22,9 @@ jobs:
           cache: true
 
       - name: Cross-compile binaries
-        run: make build-all VERSION=${{ github.ref_name }}
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: make build-all VERSION="$VERSION"
 
       - name: Generate checksums
         run: make checksums
